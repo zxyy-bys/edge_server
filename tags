@@ -1,0 +1,19 @@
+!_TAG_FILE_FORMAT	2	/extended format; --format=1 will not append ;" to lines/
+!_TAG_FILE_SORTED	1	/0=unsorted, 1=sorted, 2=foldcase/
+!_TAG_PROGRAM_AUTHOR	Darren Hiebert	/dhiebert@users.sourceforge.net/
+!_TAG_PROGRAM_NAME	Exuberant Ctags	//
+!_TAG_PROGRAM_URL	http://ctags.sourceforge.net	/official site/
+!_TAG_PROGRAM_VERSION	5.9~svn20110310	//
+client_side_listener	edge_server.c	/^int client_side_listener()$/;"	f
+connect_to_googledocs	edge_server.c	/^int connect_to_googledocs(pxy_conn_ctx_t* ctx, char * data, size_t length)$/;"	f
+error	edge_server.c	/^void error(const char *msg)$/;"	f
+init_OpenSSL	edge_server.c	/^void init_OpenSSL()$/;"	f
+main	edge_server.c	/^int main()$/;"	f
+pxy_conn_ctx	edge_server.c	/^typedef struct pxy_conn_ctx{$/;"	s	file:
+pxy_conn_ctx_free	edge_server.c	/^void pxy_conn_ctx_free(pxy_conn_ctx_t * ctx)$/;"	f
+pxy_conn_ctx_init	edge_server.c	/^pxy_conn_ctx_t *pxy_conn_ctx_init()$/;"	f	file:
+pxy_conn_ctx_t	edge_server.c	/^}pxy_conn_ctx_t;$/;"	t	typeref:struct:pxy_conn_ctx	file:
+sample	edge_server.c	/^const char* sample =$/;"	v
+send_request	edge_server.c	/^int send_request(SSL *ssl, char * data, size_t length)$/;"	f
+setup_client_ctx	edge_server.c	/^SSL_CTX * setup_client_ctx()$/;"	f
+ssl	edge_server.c	/^    SSL * ssl;$/;"	m	struct:pxy_conn_ctx	file:
