@@ -1,5 +1,12 @@
 /* A simple server in the internet domain using TCP
    The port number is passed as an argument */
+
+/*
+ * TODO: Thread pool, each thread has a struct which contains event_base and dnbase,
+ *      after main thread accept a connection, selected a thread and assigned
+ *      its evbase and dnsbase to pxy_conn_ctx_t, then add event to ctx->evbase and dnsbase
+ *      call event_use_threads() at beginning
+ * */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,6 +14,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <assert.h>
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -16,11 +24,19 @@
 #include <openssl/md5.h>
 #include <openssl/bio.h>
 #include <errno.h>
+
+
 #include <event2/event.h>
 #include <event2/listener.h>
 #include <event2/bufferevent.h>
 #include <event2/buffer.h>
 #include <event2/bufferevent_ssl.h>
+#include <event2/dns.h>
+#include <pthread.h>
+#include <arpa/inet.h>
+#include <event2/event-config.h>
+#include <event2/util.h>
+
 
 const char* sample =
 "POST /document/u/0/d/18TXk0UI5pJdEBsT9sAdHyPHCxxe7xLCyhKFAtq70TZo/save?id=18TXk0UI5pJdEBsT9sAdHyPHCxxe7xLCyhKFAtq70TZo&sid=790421622421afd6&c=1&w=1&smv=2&token=AC4w5VgGNPzUiO-KUfPoF_Xz0QmZgsyUkg%3A1488316923016 HTTP/1.1\r\n"
@@ -41,8 +57,22 @@ const char* sample =
 " Accept-Language: en-US,en;q=0.8\r\n"
 " Cookie: S=documents=q8a1dgODWNpH8B8KZzECpCJ0QpVDPIKF; SID=ZAQkPVIhK5xiebypIkXSb0koKhvctoCVvoicCu-jW5oFyVxjPtnx4oVUYb0U5ZEBQRb4SA.; HSID=Atd1pSV1erZ9q2RrJ; SSID=AMCYUP1U4lfAWS2Mt; APISID=9XTYwljWtzJ-rttO/AZcj5eIB8ryu4nSgy; SAPISID=KKZAp2KqE_-dIdh3/AggcGoVZZx7AalWmU; WRITELY_SID=ZAQkPUy7ZiPLlqUIyHwhQFkYbhVwb_E1JmSzUvuWWJZbN6Mcm73K2RTpu7BJJaToIXEOXQ.; S=explorer=F3MxOn0nSxzN0Q2yGngZrUUduxinHKKB; NID=98=5UaPqIcrUwY_xycmRncTenmJ_Zld0ppWipCPNnBlC3HIRslZ6UbTFMy5f4ud8PmRddAYt90ECoiweLgS_MOl_CrhItfod4PrxPNeZ90q4wOTa77aO_zt2uRC7QlwuCrv5tU7tRxiZ7M_YGNj3aflIy6XQvZdmGTq3X8SIpXZ200mrhCtMkCiRTyiPRN4HQxo0q8JiP_TFpQ40UQ_CgGPjsqT; llbcs=3; lbcs=2\r\n\r\n" "rev=1&bundles=%5B%7B%22commands%22%3A%5B%7B%22ty%22%3A%22is%22%2C%22ibi%22%3A1%2C%22s%22%3A%22Ty%22%7D%2C%7B%22ty%22%3A%22as%22%2C%22st%22%3A%22text%22%2C%22si%22%3A1%2C%22ei%22%3A2%2C%22sm%22%3A%7B%22ts_bd_i%22%3Atrue%2C%22ts_fs_i%22%3Atrue%2C%22ts_ff_i%22%3Atrue%2C%22ts_it_i%22%3Atrue%2C%22ts_sc_i%22%3Atrue%2C%22ts_st_i%22%3Atrue%2C%22ts_tw%22%3A400%2C%22ts_un_i%22%3Atrue%2C%22ts_va_i%22%3Atrue%2C%22ts_bgc_i%22%3Atrue%2C%22ts_fgc_i%22%3Atrue%7D%7D%5D%2C%22sid%22%3A%22790421622421afd6%22%2C%22reqId%22%3A0%7D%";
 
+typedef struct pxy_conn_desc{
+    struct bufferevent *bev;
+    SSL *ssl;
+    unsigned int closed : 1;
+}pxy_conn_desc_t;
+
 typedef struct pxy_conn_ctx{
-    SSL * ssl;
+    struct event_base * ev_base;
+    struct event *ev;
+    int fd; //source file descriptor;
+    pxy_conn_desc_t src;
+    pxy_conn_desc_t dst;
+    char* sni;
+    struct evdns_base * dnsbase;
+    struct sockaddr_storage addr;
+    socklen_t addrlen;
 }pxy_conn_ctx_t;
 
 static
@@ -53,16 +83,16 @@ pxy_conn_ctx_t *pxy_conn_ctx_init()
         perror("malloc ctx failed\n");
         exit(-1);
     }
-    ctx->ssl = NULL;
+//    ctx->ssl = NULL;
     return ctx;
 }
 
 void pxy_conn_ctx_free(pxy_conn_ctx_t * ctx)
 {
-    if(ctx->ssl != NULL){
-        SSL_shutdown(ctx->ssl);
-        SSL_free(ctx->ssl);
-    }
+    /* if(ctx->ssl != NULL){
+     *     SSL_shutdown(ctx->ssl);
+     *     SSL_free(ctx->ssl);
+     * } */
 }
 void error(const char *msg)
 {
@@ -70,104 +100,6 @@ void error(const char *msg)
     exit(1);
 }
 
-int connect_to_googledocs(pxy_conn_ctx_t*,char*, size_t);
-//listen to specific port
-/* int client_side_listener()
- * {
- *      int sockfd, newsockfd, portno;
- *      socklen_t clilen;
- *      char buffer[10000];
- *      struct sockaddr_in serv_addr, cli_addr;
- *      int n;
- *      sockfd = socket(AF_INET, SOCK_STREAM, 0);
- *      if (sockfd < 0)
- *         error("ERROR opening socket");
- *      bzero((char *) &serv_addr, sizeof(serv_addr));
- *      portno = 1234;
- *      serv_addr.sin_family = AF_INET;
- *      serv_addr.sin_addr.s_addr = INADDR_ANY;
- *      serv_addr.sin_port = htons(portno);
- *      if (bind(sockfd, (struct sockaddr *) &serv_addr,
- *               sizeof(serv_addr)) < 0)
- *               error("ERROR on binding");
- *      listen(sockfd,5);
- *      clilen = sizeof(cli_addr);
- *      newsockfd = accept(sockfd,
- *                  (struct sockaddr *) &cli_addr,
- *                  &clilen);
- *      if (newsockfd < 0)
- *           error("ERROR on accept");
- *      bzero(buffer,10000);
- *
- *      do{
- *          n = read(newsockfd,buffer,10000);
- *          if (n < 0) error("ERROR reading from socket");
- *          printf("Here is the message: %s\n",buffer);
- *          //     n = write(newsockfd,"I got your message",18);
- *          //     if (n < 0) error("ERROR writing to socket");
- *          pxy_conn_ctx_t *ctx = pxy_conn_ctx_init();
- *          connect_to_googledocs(ctx,buffer, n);
- *      }while(n > 0);
- *      close(newsockfd);
- *      close(sockfd);
- *      return 0;
- * } */
-
-void edge_listener_acceptcb(UNUSED struct evconnlistener *listener,);
-
-struct evconnlistener* edge_listener_setup(struct event_base *evbase)
-{
-    evutil_socket_t fd;
-    int rv;
-    int on = 1;
-    fd = socket(AF_INET, SOCK_STREAM,0);
-    if(fd == -1){
-        error("create socket failed\n");
-        evutil_closesocket(fd);
-    }
-    rv = evutil_make_socket_nonblocking(fd);
-    if(fd == -1){
-        error("set socket non-block failed\n");
-        evutil_closesocket(fd);
-    }
-
-    rv = setsockopt(fd, SOL_SOCKET,SO_KEEPALIVE,(void*)&on, sizeof(on));
-    if(fd == -1){
-        fprintf(stderr,"set socket opt failed %s\n",strerror(errno));
-        evutil_closesocket(fd);
-        return NULL;
-    }
-//    rv = evutil_make_listen_socket_reusable(fd);
-    if(fd == -1){
-        fprintf(stderr,"set socket reusable failed %s\n",strerror(errno));
-        evutil_closesocket(fd);
-        return NULL;
-    }
-
-    struct sockaddr_in serv_addr, cli_addr;
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_addr.s_addr = INADDR_ANY;
-    serv_addr.sin_port = htons(1234);
-    rv = bind(fd,(struct sockaddr *) &serv_addr,sizeof(struct sockaddr));
-
-    if(rv == -1){
-        fprintf(stderr,"bind socket failed %s\n",strerror(errno));
-        evutil_closesocket(fd);
-        return NULL;
-    }
-
-    struct evconnlistener* evcl = evconnlistener_new(evbase,edge_listener_acceptcb, NULL,LEV_OPT_CLOSE_ON_FREE,1024,fd);
-
-    if(evcl == NULL){
-        perror("evconnlistener_new failed %s\n",strerror(errno));
-        evutil_closesocket(fd);
-        return;
-    }
-    return evcl;
-}
-
-//Connect to google doc.
-//
 void init_OpenSSL()
 {
     if(!SSL_library_init())
@@ -181,6 +113,9 @@ SSL_CTX * setup_client_ctx()
 {
     SSL_CTX* ctx;
     ctx = SSL_CTX_new(SSLv23_method());
+    if(ctx == NULL){
+        fprintf(stderr,"SSL_CTX_new failed\n");
+    }
 
 
     SSL_CTX_set_options(ctx, SSL_OP_ALL);
@@ -224,6 +159,260 @@ SSL_CTX * setup_client_ctx()
     return ctx;
 }
 
+static void
+pxy_bev_eventcb(struct bufferevent *bev, short events, void *arg){
+    pxy_conn_ctx_t *ctx =arg;
+    pxy_conn_desc_t* this = (bev == ctx->src.bev)? &ctx->src : &ctx->dst;
+    pxy_conn_desc_t* other = (bev == ctx->src.bev)? &ctx->dst : &ctx->src;
+
+    if (events & BEV_EVENT_CONNECTED){
+       fprintf(stderr,"Connect to GOOGLE DOC\n");
+       if(this->bev == ctx->dst.bev){
+           fprintf(stderr,"write connected to client23\n");
+           //
+           //write(ctx->fd,"CONNECTED",9);
+           /* struct evbuffer *src_out = bufferevent_get_output(ctx->src.bev);
+            * evbuffer_add_printf(src_out,"CONNECTED"); */
+       }else{
+
+           fprintf(stderr,"write connected to client2\n");
+       }
+    }
+    fprintf(stderr,"write coneected finished\n");
+    return;
+
+}
+
+static void
+pxy_bev_readcb(struct bufferevent *bev, void *arg){
+    //read
+    fprintf(stderr,"readcb");
+    pxy_conn_ctx_t *ctx = arg;
+    pxy_conn_desc_t *other = (bev == ctx->src.bev) ? &ctx->dst : &ctx->src;
+
+    struct evbuffer *inbuf = bufferevent_get_input(bev);
+    struct evbuffer *outbuf = bufferevent_get_output(other->bev);
+    size_t length = evbuffer_get_length(inbuf) + 1;
+    char* data = malloc(length);
+    memset(data,'\0',length);
+    evbuffer_copyout(inbuf,data,length-1);
+
+    if(bev == ctx->src.bev){
+        fprintf(stderr,"src data %s\n",data);
+    }else{
+        fprintf(stderr,"dst data %s\n",data);
+    }
+    evbuffer_add_buffer(outbuf,inbuf);
+    if(evbuffer_get_length(outbuf) >= 1024*1024){
+        bufferevent_setwatermark(other->bev,EV_WRITE,1024*1024/2, 1024*1024);
+        bufferevent_disable(bev,EV_READ);
+    }
+}
+static void
+pxy_bev_writecb(struct bufferevent *bev, void *arg){
+    //
+    pxy_conn_ctx_t *ctx = arg;
+    pxy_conn_desc_t *other = (bev == ctx->src.bev) ? &ctx->dst : &ctx->src;
+    struct evbuffer *outbuf = bufferevent_get_output(bev);
+    if(evbuffer_get_length(outbuf) > 0){
+        bufferevent_setwatermark(bev, EV_WRITE, 0, 0);
+        bufferevent_enable(other->bev, EV_READ);
+    }
+}
+
+static struct bufferevent *
+pxy_bufferevent_setup(pxy_conn_ctx_t *ctx, evutil_socket_t fd, SSL *ssl){
+    struct bufferevent *bev;
+    if(ssl){
+        fprintf(stderr,"bufferevent_openssl_socket_new\n");
+        bev = bufferevent_openssl_socket_new(ctx->ev_base,fd,ssl,BUFFEREVENT_SSL_CONNECTING,BEV_OPT_DEFER_CALLBACKS);
+    }else{
+        //src
+        bev = bufferevent_socket_new(ctx->ev_base,fd,BEV_OPT_DEFER_CALLBACKS);
+    }
+    bufferevent_setcb(bev,pxy_bev_readcb,pxy_bev_writecb,pxy_bev_eventcb,ctx);
+    bufferevent_enable(bev,EV_READ|EV_WRITE);
+    return bev;
+}
+
+
+
+void connect_to_googledocs(int errcode, struct evutil_addrinfo* ai,void* arg)
+{
+    // TODO:
+    fprintf(stderr,"errcode %d\n",errcode);
+    pxy_conn_ctx_t *ctx = arg;
+    fprintf(stderr,"connect_to_googledocs\n");
+    //
+    ctx->src.bev = pxy_bufferevent_setup(ctx,ctx->fd,NULL);
+    fprintf(stderr,"after ctx->src.bev setup\n");
+    assert(ai != NULL);
+    memcpy(&ctx->addr,ai->ai_addr,ai->ai_addrlen);
+    fprintf(stderr,"after memcpy\n");
+    ctx->addrlen = ai->ai_addrlen;
+    //setup server connection
+    SSL_CTX * sslctx;
+    init_OpenSSL();
+    SSL_library_init();
+    //int error;
+    //    seed_prng();
+    fprintf(stderr,"before setup client ctx\n");
+    sslctx = setup_client_ctx();
+    fprintf(stderr,"after setup client ctx\n");
+    ctx->dst.ssl = SSL_new(sslctx);
+    SSL_CTX_free(sslctx);
+    fprintf(stderr,"befer setup dst ctx\n");
+    ctx->dst.bev = pxy_bufferevent_setup(ctx,-1,ctx->dst.ssl);
+    fprintf(stderr,"after setup dst buffer\n");
+
+/*     struct sockaddr_in serv_addr;
+ *     serv_addr.sin_family = AF_INET;
+ * //    serv_addr.sin_addr.s_addr = INADDR_ANY;
+ *     serv_addr.sin_port = htons(443);
+ *     inet_pton(AF_INET,"149.125.72.196",&serv_addr.sin_addr); */
+    fprintf(stderr,"socket_connect\n");
+    bufferevent_socket_connect(ctx->dst.bev,(struct sockaddr *) &ctx->addr,ctx->addrlen);
+        /* conn = BIO_new_connect("4.docs.google.com:443"); */
+//        conn = BIO_new_connect("172.217.2.14:443");
+/*         if(!conn)
+ *             perror("Error creating connection BIO\n");
+ *         if((error = BIO_do_connect(conn)) <= 0){
+ *             perror("Error connecting to remote machine\n");
+ *         }
+ *         fprintf(stderr,"BIO_do_connect %d\n",error);
+ *         if(!(ssl = SSL_new(sslctx)))
+ *             perror("Error creating an SSL context\n");
+ *         SSL_set_bio(ssl,conn,conn);
+ *         if( (error = SSL_connect(ssl)) <= 0 ){
+ *             perror("Error connecting SSL google docs\n");
+ *         }
+ *
+ *         fprintf(stderr,"SSL_connect %d\n",error);
+ *         SSL_CTX_free(sslctx);
+ *         ctx->ssl = ssl; */
+//    send_request(ctx->ssl,data,length);
+    return ;
+}
+
+struct fd_wrap{
+    evutil_socket_t fd;
+};
+void* search_sni(void * arg)
+{
+//    char sniport[6];
+    pxy_conn_ctx_t * ctx = pxy_conn_ctx_init();
+    ctx->fd = ((struct fd_wrap *)arg)->fd;
+    struct evutil_addrinfo hints;
+    char* buff = malloc(100);
+    memset(buff,'\0',100);
+    int n = 0;
+    do{
+        n = read(ctx->fd, buff,100);
+    }while( n < 0);
+    fprintf(stderr,"read %s\n",buff);
+    if(n > 0){
+        ctx->sni = buff;
+//        write(ctx->fd,"CONNECTED",9);
+        fprintf(stderr,"write, %s\n",ctx->sni);
+    }else{
+        fprintf(stderr,"can not read sni %s\n",strerror(errno));
+        free(buff);
+        return NULL;
+    }
+    memset(&hints,0,sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_flags = EVUTIL_AI_ADDRCONFIG;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    ctx->ev_base = event_base_new();
+    ctx->dnsbase = evdns_base_new(ctx->ev_base,1);
+    fprintf(stderr,"evdns_getaddrinfo\n");
+    evdns_getaddrinfo(ctx->dnsbase, ctx->sni/* "docs.google.com"*/,"443",&hints, connect_to_googledocs,ctx);
+    event_base_dispatch(ctx->ev_base);
+    return NULL;
+}
+void edge_listener_acceptcb(struct evconnlistener *listener, evutil_socket_t fd,
+                            struct sockaddr *peeraddr, int peeraddrlen,
+                            void *arg){
+    fprintf(stderr,"accept\n");
+    /* char* buff = malloc(100);
+     * memset(buff,'\0',100);
+     * int n = 0;
+     * n = read(fd, buff,100);
+     * fprintf(stderr,"read %s\n",buff);
+     * if(n > 0){
+     *     ctx->sni = buff;
+     *     write(fd,"CONNECTED",9);
+     *     fprintf(stderr,"write\n");
+     * }else{
+     *     fprintf(stderr,"can not read sni %s\n",strerror(errno));
+     *     free(buff);
+     *     return;
+     * } */
+//    ctx->fd = fd;
+    pthread_t th;
+    struct fd_wrap* fw  = malloc(sizeof(struct fd_wrap));
+    fw->fd = fd;
+    pthread_create(&th, NULL,search_sni,fw);
+//    connect_to_googledocs(ctx);
+}
+
+struct evconnlistener* edge_listener_setup(struct event_base *evbase)
+{
+    evutil_socket_t fd;
+    int rv;
+    int on = 1;
+    fd = socket(AF_INET, SOCK_STREAM,0);
+    if(fd == -1){
+        error("create socket failed\n");
+        evutil_closesocket(fd);
+    }
+    rv = evutil_make_socket_nonblocking(fd);
+    if(fd == -1){
+        error("set socket non-block failed\n");
+        evutil_closesocket(fd);
+    }
+
+    rv = setsockopt(fd, SOL_SOCKET,SO_KEEPALIVE,(void*)&on, sizeof(on));
+    if(fd == -1){
+        fprintf(stderr,"set socket opt failed %s\n",strerror(errno));
+        evutil_closesocket(fd);
+        return NULL;
+    }
+//    rv = evutil_make_listen_socket_reusable(fd);
+    if(fd == -1){
+        fprintf(stderr,"set socket reusable failed %s\n",strerror(errno));
+        evutil_closesocket(fd);
+        return NULL;
+    }
+
+    struct sockaddr_in serv_addr, cli_addr;
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_addr.s_addr = INADDR_ANY;
+    serv_addr.sin_port = htons(1234);
+    rv = bind(fd,(struct sockaddr *) &serv_addr,sizeof(struct sockaddr));
+
+    if(rv == -1){
+        fprintf(stderr,"bind socket failed %s\n",strerror(errno));
+        evutil_closesocket(fd);
+        return NULL;
+    }
+
+    fprintf(stderr,"evconnlistener_new\n");
+    struct evconnlistener* evcl = evconnlistener_new(evbase,edge_listener_acceptcb, NULL,LEV_OPT_CLOSE_ON_FREE,1024,fd);
+    fprintf(stderr,"evconnlistener_new 2\n");
+
+    if(evcl == NULL){
+        error("evconnlistener_new failed \n");
+        evutil_closesocket(fd);
+        return NULL;
+    }
+    return evcl;
+}
+
+//Connect to google doc.
+//
+
 int send_request(SSL *ssl, char * data, size_t length)
 {
     int err;
@@ -243,45 +432,15 @@ int send_request(SSL *ssl, char * data, size_t length)
     return 1;
 }
 
-int connect_to_googledocs(pxy_conn_ctx_t* ctx, char * data, size_t length)
-{
-    if(ctx->ssl == NULL){
-        BIO * conn;
-        SSL * ssl;
-        SSL_CTX * sslctx;
-        init_OpenSSL();
-        int error;
-        //    seed_prng();
-        sslctx = setup_client_ctx();
 
-        conn = BIO_new_connect("4.docs.google.com:443");
-//        conn = BIO_new_connect("172.217.2.14:443");
-        if(!conn)
-            perror("Error creating connection BIO\n");
-        if((error = BIO_do_connect(conn)) <= 0){
-            perror("Error connecting to remote machine\n");
-        }
-        fprintf(stderr,"BIO_do_connect %d\n",error);
-        if(!(ssl = SSL_new(sslctx)))
-            perror("Error creating an SSL context\n");
-        SSL_set_bio(ssl,conn,conn);
-        if( (error = SSL_connect(ssl)) <= 0 ){
-            perror("Error connecting SSL google docs\n");
-        }
-
-        fprintf(stderr,"SSL_connect %d\n",error);
-        SSL_CTX_free(sslctx);
-        ctx->ssl = ssl;
-    }
-    send_request(ctx->ssl,data,length);
-    return 0;
-}
 
 int main()
 {
     /* fprintf(stderr,"start connecting to google docs\n");
      * connect_to_googledocs();
      * fprintf(stderr,"finish connecting to google docs\n"); */
-    client_side_listener();
-
+    struct event_base *evbase = event_base_new();
+    edge_listener_setup(evbase);
+    event_base_dispatch(evbase);
+    return 1;
 }
